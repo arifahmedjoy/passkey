@@ -415,8 +415,14 @@ function passkey_activate($params)
 
             if (result.status === 'success') {
                 document.getElementById('deviceNameInput').value = '';
-                passkeySetStatus('<i class="fa fa-check"></i> Device registered successfully!', 'success');
-                passkeyLoadList();
+                passkeySetStatus('<i class="fa fa-check"></i> Device registered successfully! Activating 2FA...', 'success');
+                document.getElementById('passkey_verified_signal').value = '1';
+                var activateForm = document.getElementById('passkey_verified_signal').closest('form');
+                if (activateForm) {
+                    setTimeout(function() { activateForm.submit(); }, 800);
+                } else {
+                    passkeyLoadList();
+                }
             } else {
                 throw new Error(result.error || 'Registration failed.');
             }
