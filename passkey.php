@@ -12,13 +12,17 @@ if (!defined("WHMCS")) {
 }
 
 // ─── Encryption Settings ─────────────────────────────────────────────────────
-define('PASSKEY_ENC_KEY', hash('sha256', $cc_encryption_hash, true));
+// Store as hex (not raw binary) so it is always a safe UTF-8 string.
+// hex2bin() is called at the point of use inside passkey_encrypt().
+if (!defined('PASSKEY_ENC_KEY')) {
+    define('PASSKEY_ENC_KEY', hash('sha256', $cc_encryption_hash));
+}
 
 function passkey_encrypt($data)
 {
     $iv = random_bytes(12);
     $tag = "";
-    $ciphertext = openssl_encrypt($data, 'aes-256-gcm', PASSKEY_ENC_KEY, OPENSSL_RAW_DATA, $iv, $tag);
+    $ciphertext = openssl_encrypt($data, 'aes-256-gcm', hex2bin(PASSKEY_ENC_KEY), OPENSSL_RAW_DATA, $iv, $tag);
     return base64_encode($iv . $tag . $ciphertext);
 }
 
@@ -37,6 +41,66 @@ function getPasskeyProcessPath()
 {
     $systemUrl = \WHMCS\Config\Setting::getValue('SystemURL');
     return rtrim($systemUrl, '/') . '/modules/security/passkey/process.php';
+}
+
+function passkey_getCurrentUserIdentity()
+{
+    $adminId = \WHMCS\Session::get("adminid");
+    $clientId = \WHMCS\Session::get("uid");
+
+    if ($adminId) {
+        return [$adminId, 'admin'];
+    }
+
+    if ($clientId) {
+        return [$clientId, 'client'];
+    }
+
+    return [null, null];
+}
+
+function passkey_deleteUserPasskeys($userId, $userType)
+{
+    if (!$userId || !$userType) {
+        return 0;
+    }
+
+    return \WHMCS\Database\Capsule::table('mod_passkeys')
+        ->where('user_id', $userId)
+        ->where('user_type', $userType)
+        ->delete();
+}
+
+function passkey_sanitizeOutput($value)
+{
+    $value = (string) $value;
+
+    if (function_exists('mb_convert_encoding')) {
+        $value = mb_convert_encoding($value, 'UTF-8', 'UTF-8');
+    }
+
+    if (function_exists('iconv')) {
+        $cleanValue = iconv('UTF-8', 'UTF-8//IGNORE', $value);
+        if ($cleanValue !== false) {
+            $value = $cleanValue;
+        }
+    }
+
+    return preg_replace('/[^\x09\x0A\x0D\x20-\x7E]/', '', $value);
+}
+
+function passkey_handleDisableCleanup()
+{
+    list($userId, $userType) = passkey_getCurrentUserIdentity();
+
+    if (!$userId || !$userType) {
+        throw new WHMCS\Exception("Authenticated session required to disable Passkey.");
+    }
+
+    passkey_deleteUserPasskeys($userId, $userType);
+    unset($_SESSION['passkey_verified'], $_SESSION['2fa_verified']);
+
+    return ["settings" => ["status" => "inactive"]];
 }
 
 // ─── Activate (Registration & Management UI) ─────────────────────────────────
@@ -71,10 +135,7 @@ function passkey_activate($params)
     $processPathJs = json_encode($processPath);
 
     // Pre-set signal to 1 if the user already has passkeys registered
-    $adminId = \WHMCS\Session::get("adminid");
-    $clientId = \WHMCS\Session::get("uid");
-    $userId   = $adminId ?: $clientId;
-    $userType = $adminId ? 'admin' : 'client';
+    list($userId, $userType) = passkey_getCurrentUserIdentity();
     $initialSignal = 0;
     if ($userId) {
         $existing = \WHMCS\Database\Capsule::table('mod_passkeys')
@@ -82,7 +143,7 @@ function passkey_activate($params)
         $initialSignal = $existing > 0 ? 1 : 0;
     }
 
-    return <<<HTML
+    $html = <<<HTML
     <style>
         #passkeyPanel .passkey-section-title {
             margin: 0 0 10px;
@@ -210,6 +271,36 @@ function passkey_activate($params)
     function passkeyUpdateSignal(count) {
         document.getElementById('passkey_verified_signal').value = count > 0 ? '1' : '0';
     }
+
+    function passkeyEnsureManageLink() {
+        var manageLink = jQuery('.twofa-config-link.enable');
+        if (!manageLink.length) return;
+
+        manageLink
+            .removeClass('hidden')
+            .show()
+            .text('Manage Passkeys')
+            .attr('title', 'Manage Passkeys');
+    }
+
+    function passkeyMarkEnabledState() {
+        if (jQuery.fn.bootstrapSwitch) {
+            jQuery('.twofa-toggle-switch').bootstrapSwitch('state', true, true);
+        }
+
+        passkeyEnsureManageLink();
+        jQuery('.twofa-config-link.disable').removeClass('hidden').show();
+    }
+
+    function passkeySubmitActivationForm(activateForm) {
+        return jQuery.ajax({
+            url: activateForm.action || window.location.href,
+            type: 'POST',
+            dataType: 'json',
+            data: jQuery(activateForm).serialize()
+        });
+    }
+
 
     function passkeyRenderList(devices) {
         var container = document.getElementById('passkeyDeviceList');
@@ -415,12 +506,27 @@ function passkey_activate($params)
 
             if (result.status === 'success') {
                 document.getElementById('deviceNameInput').value = '';
-                passkeySetStatus('<i class="fa fa-check"></i> Device registered successfully! Activating 2FA...', 'success');
                 document.getElementById('passkey_verified_signal').value = '1';
                 var activateForm = document.getElementById('passkey_verified_signal').closest('form');
                 if (activateForm) {
-                    setTimeout(function() { activateForm.submit(); }, 800);
+                    passkeySetStatus('<i class="fa fa-check"></i> Device registered! Activating 2FA...', 'success');
+                    activateForm.method = 'post';
+                    passkeySubmitActivationForm(activateForm)
+                        .done(function(response) {
+                            var modalBody = jQuery(activateForm).closest('.modal-content').find('.modal-body').first();
+                            passkeyMarkEnabledState();
+
+                            if (response && response.body && modalBody.length) {
+                                modalBody.html(response.body);
+                            } else {
+                                passkeySetStatus('<i class="fa fa-check"></i> Passkey enabled successfully.', 'success');
+                            }
+                        })
+                        .fail(function(xhr) {
+                            passkeySetStatus('<i class="fa fa-warning"></i> Failed to activate 2FA: ' + passkeyEscHtml(xhr.status ? ('HTTP ' + xhr.status) : 'Unknown error'), 'error');
+                        });
                 } else {
+                    passkeySetStatus('<i class="fa fa-check"></i> Device registered successfully!', 'success');
                     passkeyLoadList();
                 }
             } else {
@@ -440,6 +546,8 @@ function passkey_activate($params)
     passkeyLoadList();
     </script>
 HTML;
+
+    return passkey_sanitizeOutput($html);
 }
 
 function passkey_activateverify($params)
@@ -448,7 +556,36 @@ function passkey_activateverify($params)
     if ($signal == '1') {
         return ["settings" => ["status" => "active"]];
     }
-    throw new WHMCS\Exception("Biometric verification required.");
+
+    try {
+        return passkey_handleDisableCleanup();
+    } catch (\Exception $e) {
+        throw new WHMCS\Exception("Failed to remove registered passkeys while disabling Passkey.");
+    }
+}
+
+function passkey_deactivateverify($params)
+{
+    try {
+        return passkey_handleDisableCleanup();
+    } catch (\Exception $e) {
+        throw new WHMCS\Exception("Failed to remove registered passkeys while disabling Passkey.");
+    }
+}
+
+function passkey_deactivate($params)
+{
+    return passkey_handleDisableCleanup();
+}
+
+function passkey_disableverify($params)
+{
+    return passkey_handleDisableCleanup();
+}
+
+function passkey_disable($params)
+{
+    return passkey_handleDisableCleanup();
 }
 
 // ─── Challenge UI (2FA Step) ─────────────────────────────────────────────────
@@ -460,7 +597,7 @@ function passkey_challenge($params)
     $csrfTokenJs  = json_encode($csrfToken);
     $processPathJs = json_encode($processPath);
 
-    return <<<HTML
+    $html = <<<HTML
     <div align="center" style="padding:20px;">
         <i class="fa fa-shield-alt fa-3x" style="color:#185bb6;"></i>
         <h4>Verification Required</h4>
@@ -534,6 +671,8 @@ function passkey_challenge($params)
     (function() { if (window.PublicKeyCredential) setTimeout(() => { startPasskeyAuth(false); }, 500); })();
     </script>
 HTML;
+
+    return passkey_sanitizeOutput($html);
 }
 
 function passkey_verify($params)

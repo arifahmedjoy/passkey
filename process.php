@@ -18,14 +18,18 @@ if (ob_get_length()) ob_clean();
 header('Content-Type: application/json');
 
 // ─── Constants & Encryption Settings ─────────────────────────────────────────
-define('PASSKEY_ENC_KEY', hash('sha256', $cc_encryption_hash, true));
+// Store as hex (not raw binary) so the constant is always a safe UTF-8 string.
+// hex2bin() is called at the point of use.
+if (!defined('PASSKEY_ENC_KEY')) {
+    define('PASSKEY_ENC_KEY', hash('sha256', $cc_encryption_hash));
+}
 
 // ─── Encryption Helpers ──────────────────────────────────────────────────────
 function passkey_encrypt($data)
 {
     $iv = random_bytes(12);
     $tag = "";
-    $ciphertext = openssl_encrypt($data, 'aes-256-gcm', PASSKEY_ENC_KEY, OPENSSL_RAW_DATA, $iv, $tag);
+    $ciphertext = openssl_encrypt($data, 'aes-256-gcm', hex2bin(PASSKEY_ENC_KEY), OPENSSL_RAW_DATA, $iv, $tag);
     return base64_encode($iv . $tag . $ciphertext);
 }
 
@@ -121,7 +125,7 @@ switch ($action) {
                     'name' => $email ?: ($userType . '_' . $userId), // Unique internal name (Email is best)
                     'displayName' => $displayName
                 ]
-            ]);
+            ], JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
         } catch (\Exception $e) {
             echo json_encode(['status' => 'error', 'error' => 'Token failed.']);
         }
@@ -283,7 +287,7 @@ switch ($action) {
             $tag = substr($data, 12, 16);
             $ciphertext = substr($data, 28);
 
-            $decryptedId = openssl_decrypt($ciphertext, 'aes-256-gcm', PASSKEY_ENC_KEY, OPENSSL_RAW_DATA, $iv, $tag);
+            $decryptedId = openssl_decrypt($ciphertext, 'aes-256-gcm', hex2bin(PASSKEY_ENC_KEY), OPENSSL_RAW_DATA, $iv, $tag);
 
             if ($decryptedId === $input['id']) {
                 $found = true;
